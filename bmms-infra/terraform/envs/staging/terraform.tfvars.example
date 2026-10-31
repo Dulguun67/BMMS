@@ -1,0 +1,10 @@
+# cp terraform.tfvars.example terraform.tfvars  (git-д оруулахгүй)
+region          = "ap-northeast-2"
+domain          = "staging.bmms.example.mn"
+origin_domain   = "origin.staging.bmms.example.mn"
+mail_domain     = "staging.bmms.example.mn"
+route53_zone_id = "Z0123456789ABCDEFGHIJ"
+github_repo     = "your-org/bmms"
+alarm_email     = "security-alerts@example.mn"
+# 1-р apply: 0. Image, нууц, migration бэлэн болмогц 1 болгож дахин apply
+api_desired_count = 0

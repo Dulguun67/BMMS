@@ -1,0 +1,122 @@
+# БММС API: тест (MySQL 8.4) → image build → ECR скан → migration → ECS deploy → smoke test
+# Third-party action бүрийг commit SHA-аар түгжсэн (tag-ийг дарж бичих халдлагаас хамгаална).
+name: api
+on:
+  push:
+    branches: [main]
+    paths: ["bmms-api/**", "bmms-infra/scripts/**", ".github/workflows/api.yml"]
+  pull_request:
+    paths: ["bmms-api/**", ".github/workflows/api.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: api-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-only
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-root-only"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+    defaults:
+      run:
+        working-directory: bmms-api
+    env:
+      DB_HOST: 127.0.0.1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bmms-api/package-lock.json
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Schema (migration + demo seed)
+        env:
+          MIGRATE_DB_USER: root
+          MIGRATE_DB_PASSWORD: ci-root-only
+        run: |
+          node scripts/migrate.js
+          node scripts/migrate.js --seed db/seeds/demo_data.sql
+          APP_DB_USER=bmms_ci APP_DB_PASSWORD=ci-app-password-0123456789abcdef DB_USER_REQUIRE_SSL=false node scripts/db-user.js
+      - name: Test
+        env:
+          DB_USER: bmms_ci
+          DB_PASSWORD: ci-app-password-0123456789abcdef
+        run: npm test
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC → AWS (урт хугацааны түлхүүргүй)
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      TASK_SUBNETS: ${{ vars.TASK_SUBNETS }}
+      TASK_SECURITY_GROUP: ${{ vars.TASK_SECURITY_GROUP }}
+      IMAGE: ${{ vars.ECR_REPOSITORY_URL }}:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: bmms-api
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}
+
+      - name: ECR скан (HIGH/CRITICAL байвал зогсоно)
+        run: |
+          REPO="${IMAGE%%:*}"; REPO="${REPO#*/}"
+          aws ecr wait image-scan-complete --repository-name "$REPO" --image-id imageTag="${{ github.sha }}"
+          COUNTS="$(aws ecr describe-image-scan-findings --repository-name "$REPO" --image-id imageTag="${{ github.sha }}" \
+            --query 'imageScanFindings.findingSeverityCounts' --output json)"
+          echo "Findings: $COUNTS"
+          BAD="$(echo "${COUNTS:-null}" | jq '((. // {}).CRITICAL // 0) + ((. // {}).HIGH // 0)')"
+          if [ "$BAD" -gt 0 ]; then echo "::error::Image-д $BAD HIGH/CRITICAL эмзэг байдал илэрлээ"; exit 1; fi
+
+      - name: Migration, API-ийн DB хэрэглэгч
+        # db-user нь idempotent: анхны deploy-д хэрэглэгч үүсгэнэ, дараа нь Secrets Manager дахь нууц үгийг DB-д тусгана
+        run: |
+          TD="$(bmms-infra/scripts/register-image.sh "${{ vars.TASK_FAMILY_MIGRATE }}" "$IMAGE")"
+          bmms-infra/scripts/run-task.sh "$TD"
+          TD="$(bmms-infra/scripts/register-image.sh "${{ vars.TASK_FAMILY_DBUSER }}" "$IMAGE")"
+          bmms-infra/scripts/run-task.sh "$TD"
+
+      - name: Deploy API
+        run: |
+          TD="$(bmms-infra/scripts/register-image.sh "${{ vars.TASK_FAMILY_API }}" "$IMAGE")"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "${{ vars.ECS_SERVICE }}" --task-definition "$TD" >/dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "${{ vars.ECS_SERVICE }}"
+          aws ssm put-parameter --name "${{ vars.IMAGE_TAG_PARAMETER }}" --value "${{ github.sha }}" --overwrite >/dev/null
+
+      - name: Smoke test (CloudFront → ALB → API)
+        run: |
+          DESIRED="$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "${{ vars.ECS_SERVICE }}" --query 'services[0].desiredCount' --output text)"
+          if [ "$DESIRED" = "0" ]; then echo "::notice::api_desired_count=0 (анхны байршуулалт): smoke test алгаслаа"; exit 0; fi
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' "${{ vars.APP_URL }}/api/v1/auth/me")"
+          echo "GET /api/v1/auth/me → $CODE"
+          [ "$CODE" = "401" ] || { echo "::error::API хүлээгдэж буй 401 биш $CODE буцаалаа"; exit 1; }

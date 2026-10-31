@@ -1,0 +1,32 @@
+{
+  "name": "bmms-api",
+  "version": "1.0.0",
+  "description": "БММС — Бүлгийн менежментийн мэдээллийн системийн REST API (Node.js, Express, MySQL 8, JWT)",
+  "main": "src/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-concurrency=1 --test-timeout=120000 test/*.test.js",
+    "migrate": "node scripts/migrate.js",
+    "retention": "node scripts/retention.js",
+    "create-user": "node scripts/create-user.js",
+    "gen-key": "node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\""
+  },
+  "dependencies": {
+    "@aws-sdk/client-sesv2": "3.1152.0",
+    "cookie-parser": "1.4.7",
+    "cors": "2.8.5",
+    "express": "4.22.3",
+    "express-rate-limit": "7.5.0",
+    "helmet": "8.0.0",
+    "jsonwebtoken": "9.0.3",
+    "mysql2": "3.24.6",
+    "pino": "9.6.0",
+    "pino-http": "10.4.0",
+    "zod": "4.6.7"
+  }
+}
